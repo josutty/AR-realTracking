@@ -67,16 +67,35 @@ export default function CADOverlayApp() {
   // ── LOAD SCRIPTS ──
   useEffect(() => {
     async function loadLibs() {
+      // Load Three.js
       try {
         await loadScript("https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js");
         await loadScript("https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/STLLoader.js");
         setThreeReady(true);
-      } catch(e) { console.error("Three.js load failed", e); }
+      } catch (e) {
+        console.error("Three.js failed", e);
+      }
+
+      // Load OpenCV from local file
       try {
-        await loadScript("https://docs.opencv.org/4.8.0/opencv.js");
-        await new Promise(res => { const c = () => { if(window.cv && window.cv.Mat) res(); else setTimeout(c,100); }; c(); });
+        await loadScript("/opencv.js");  // ← served from your own app
+
+        await new Promise((res, rej) => {
+          let attempts = 0;
+          const check = () => {
+            attempts++;
+            if (window.cv && window.cv.Mat) res();
+            else if (attempts > 150) rej(new Error("OpenCV timed out after 15s"));
+            else setTimeout(check, 100);
+          };
+          check();
+        });
+
         setCvReady(true);
-      } catch { setCvError(true); }
+      } catch (e) {
+        console.error("OpenCV failed:", e);
+        setCvError(true);
+      }
     }
     loadLibs();
     return () => cleanupAll();
