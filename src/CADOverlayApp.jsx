@@ -1,8 +1,10 @@
-// ── CAD OVERLAY APP ──
-// Single-file React app: STL upload → camera overlay → manual alignment → ORB tracking
+// ── CAD OVERLAY APP — WebXR Edition ──
+// STL Upload → WebXR AR Session → Manual Placement → Anchor Lock
+// Uses ARCore (Android) / ARKit (iOS) via navigator.xr
 
 import { useState, useRef, useEffect, useCallback } from "react";
 
+// ── SCRIPT LOADER ──
 function loadScript(src) {
   return new Promise((resolve, reject) => {
     if (document.querySelector(`script[src="${src}"]`)) { resolve(); return; }
@@ -12,571 +14,794 @@ function loadScript(src) {
   });
 }
 
+// ── TOAST ──
 function Toast({ message, type = "info", onDone }) {
-  useEffect(() => { const t = setTimeout(onDone, 3000); return () => clearTimeout(t); }, []);
-  const bg = type === "success" ? "#00ff88" : type === "warn" ? "#ffcc00" : "#ff4444";
-  const tx = type === "success" || type === "warn" ? "#000" : "#fff";
+  useEffect(() => { const t = setTimeout(onDone, 3500); return () => clearTimeout(t); }, []);
+  const colors = {
+    success: { bg: "#00ff88", tx: "#000" },
+    warn:    { bg: "#ffcc00", tx: "#000" },
+    error:   { bg: "#ff4444", tx: "#fff" },
+    info:    { bg: "#0088ff", tx: "#fff" },
+  };
+  const c = colors[type] || colors.info;
   return (
     <div style={{
-      position:"fixed",top:80,left:"50%",transform:"translateX(-50%)",
-      background:bg,color:tx,padding:"10px 20px",borderRadius:8,
-      fontFamily:"monospace",fontWeight:700,fontSize:13,zIndex:9999,
-      boxShadow:`0 0 20px ${bg}88`,letterSpacing:0.5,
-      animation:"fadeInDown 0.3s ease"
+      position:"fixed", top:90, left:"50%", transform:"translateX(-50%)",
+      background:c.bg, color:c.tx, padding:"10px 22px", borderRadius:10,
+      fontFamily:"'JetBrains Mono',monospace", fontWeight:700, fontSize:12,
+      zIndex:9999, letterSpacing:0.5, whiteSpace:"nowrap",
+      animation:"toastIn 0.3s cubic-bezier(0.34,1.56,0.64,1)",
+      boxShadow:`0 4px 24px ${c.bg}66`
     }}>{message}</div>
   );
 }
 
+// ── SCAN ANIMATION ──
+function ScanRing() {
+  return (
+    <div style={{ position:"relative", width:180, height:180, margin:"0 auto 24px" }}>
+      {[0,1,2].map(i => (
+        <div key={i} style={{
+          position:"absolute", inset:0, borderRadius:"50%",
+          border:"1px solid #00ff88",
+          animation:`scanRing 2s ease-out ${i*0.6}s infinite`,
+          opacity:0
+        }} />
+      ))}
+      <div style={{
+        position:"absolute", inset:"30%", borderRadius:"50%",
+        background:"rgba(0,255,136,0.08)", border:"1px solid #00ff8844",
+        display:"flex", alignItems:"center", justifyContent:"center"
+      }}>
+        <div style={{ fontSize:32 }}>⬡</div>
+      </div>
+    </div>
+  );
+}
+
+// ── MAIN APP ──
 export default function CADOverlayApp() {
+
+  // ── STATE ──
   const [step, setStep] = useState("upload");
+  // upload | checking | ar | placed | error
   const [threeReady, setThreeReady] = useState(false);
-  const [cvReady, setCvReady] = useState(false);
-  const [cvError, setCvError] = useState(false);
+  const [xrSupported, setXrSupported] = useState(null); // null=checking, true, false
   const [parseInfo, setParseInfo] = useState(null);
   const [parseError, setParseError] = useState(null);
-  const [camError, setCamError] = useState(null);
-  const [trackingState, setTrackingState] = useState("idle");
-  const [matchCount, setMatchCount] = useState(0);
+  const [arError, setArError] = useState(null);
   const [toast, setToast] = useState(null);
-  const [transform, setTransform] = useState({ x:0, y:0, scale:1, rotX:0, rotY:0, rotZ:0 });
+  const [transform, setTransform] = useState({ scale:1, rotY:0 });
+  const [isPlaced, setIsPlaced] = useState(false);
+  const [hitAvailable, setHitAvailable] = useState(false);
+  const [scanning, setScanning] = useState(true);
+  const [fov, setFov] = useState(70);
+  const [showFovTuner, setShowFovTuner] = useState(false);
 
-  const previewCanvasRef = useRef(null);
-  const overlayCanvasRef = useRef(null);
-  const videoRef = useRef(null);
-  const gestureRef = useRef(null);
-  const rendererPreviewRef = useRef(null);
-  const rendererOverlayRef = useRef(null);
-  const sceneRef = useRef(null);
-  const cameraRef = useRef(null);
-  const meshRef = useRef(null);
-  const geometryRef = useRef(null);
-  const streamRef = useRef(null);
-  const animFrameRef = useRef(null);
-  const previewAnimRef = useRef(null);
-  const transformRef = useRef({ x:0, y:0, scale:1, rotX:0, rotY:0, rotZ:0 });
-  const refDataRef = useRef(null);
-  const orbRef = useRef(null);
-  const isDraggingRef = useRef(false);
-  const lastPointerRef = useRef({ x:0, y:0 });
-  const lastPinchRef = useRef(null);
-  const lastTwoFingerAngleRef = useRef(null);
-  const rightClickRef = useRef(false);
-  const shiftRef = useRef(false);
-  const ctrlRef = useRef(false);
+  // ── REFS ──
+  const canvasRef           = useRef(null);
+  const geometryRef         = useRef(null);
+  const previewCanvasRef    = useRef(null);
+  const previewAnimRef      = useRef(null);
+  const rendererPreviewRef  = useRef(null);
 
-  // ── LOAD SCRIPTS ──
+  // WebXR / Three.js refs
+  const rendererRef         = useRef(null);
+  const sceneRef            = useRef(null);
+  const cameraRef           = useRef(null);
+  const meshRef             = useRef(null);
+  const reticleMeshRef      = useRef(null);
+  const xrSessionRef        = useRef(null);
+  const xrRefSpaceRef       = useRef(null);
+  const hitTestSrcRef       = useRef(null);
+  const animFrameRef        = useRef(null);
+  const transformRef        = useRef({ scale:1, rotY:0 });
+  const placedRef           = useRef(false);
+  const lastTouchRef        = useRef(null);
+  const lastPinchRef        = useRef(null);
+  const lastAngleRef        = useRef(null);
+  const gestureLayerRef     = useRef(null);
+
+  // ── LOAD THREE.JS ──
   useEffect(() => {
-    async function loadLibs() {
-      // Load Three.js
+    async function load() {
       try {
         await loadScript("https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js");
         await loadScript("https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/STLLoader.js");
         setThreeReady(true);
-      } catch (e) {
-        console.error("Three.js failed", e);
-      }
+      } catch(e) { console.error("Three.js failed", e); }
 
-      // Load OpenCV from local file
-      try {
-        await loadScript("/opencv.js");  // ← served from your own app
-
-        await new Promise((res, rej) => {
-          let attempts = 0;
-          const check = () => {
-            attempts++;
-            if (window.cv && window.cv.Mat) res();
-            else if (attempts > 150) rej(new Error("OpenCV timed out after 15s"));
-            else setTimeout(check, 100);
-          };
-          check();
-        });
-
-        setCvReady(true);
-      } catch (e) {
-        console.error("OpenCV failed:", e);
-        setCvError(true);
+      // Check WebXR support
+      if (navigator.xr) {
+        try {
+          const supported = await navigator.xr.isSessionSupported("immersive-ar");
+          setXrSupported(supported);
+        } catch { setXrSupported(false); }
+      } else {
+        setXrSupported(false);
       }
     }
-    loadLibs();
-    return () => cleanupAll();
+    load();
+    return () => cleanupAR();
   }, []);
 
   // ── STL PARSE ──
-  const handleFileSelect = useCallback((file) => {
-    if (!file || !file.name.toLowerCase().endsWith(".stl")) { setParseError("Only .stl files accepted."); return; }
-    if (!threeReady) { setParseError("3D engine loading, please wait..."); return; }
+  const handleFile = useCallback((file) => {
+    if (!file || !file.name.toLowerCase().endsWith(".stl")) {
+      setParseError("Only .stl files accepted."); return;
+    }
+    if (!threeReady) { setParseError("3D engine loading..."); return; }
     setParseError(null); setParseInfo(null);
+
     const reader = new FileReader();
     reader.onload = (e) => {
       try {
         const THREE = window.THREE;
-        const loader = new THREE.STLLoader();
-        const geometry = loader.parse(e.target.result);
-        geometry.computeBoundingBox(); geometry.center();
-        const bb = geometry.boundingBox;
+        const geo = new THREE.STLLoader().parse(e.target.result);
+        geo.computeBoundingBox(); geo.center();
+        const bb = geo.boundingBox;
         const w = (bb.max.x - bb.min.x).toFixed(1);
         const h = (bb.max.y - bb.min.y).toFixed(1);
         const d = (bb.max.z - bb.min.z).toFixed(1);
-        const triangles = Math.round(geometry.attributes.position.count / 3);
-        geometryRef.current = geometry;
-        setParseInfo({ name: file.name, triangles, w, h, d });
-        setTimeout(() => initPreview(geometry), 50);
-      } catch { setParseError("Failed to parse STL. Is it a valid binary or ASCII STL?"); }
+        const tris = Math.round(geo.attributes.position.count / 3);
+        geometryRef.current = geo;
+        setParseInfo({ name: file.name, tris, w, h, d });
+        setTimeout(() => initPreview(geo), 50);
+      } catch { setParseError("Invalid STL file. Try another file."); }
     };
     reader.readAsArrayBuffer(file);
   }, [threeReady]);
 
-  function initPreview(geometry) {
-    const canvas = previewCanvasRef.current;
-    if (!canvas) return;
+  function initPreview(geo) {
+    const canvas = previewCanvasRef.current; if(!canvas) return;
     const THREE = window.THREE;
-    if (rendererPreviewRef.current) { rendererPreviewRef.current.dispose(); cancelAnimationFrame(previewAnimRef.current); }
+    if (rendererPreviewRef.current) {
+      rendererPreviewRef.current.dispose();
+      cancelAnimationFrame(previewAnimRef.current);
+    }
     const renderer = new THREE.WebGLRenderer({ canvas, alpha:true, antialias:true });
-    renderer.setSize(300,300); renderer.setClearColor(0x000000,0);
+    renderer.setSize(280, 280); renderer.setClearColor(0,0);
     rendererPreviewRef.current = renderer;
     const scene = new THREE.Scene();
-    const camera = new THREE.PerspectiveCamera(45,1,0.01,1000);
+    const cam = new THREE.PerspectiveCamera(45, 1, 0.01, 1000);
     const sphere = new THREE.Sphere();
-    new THREE.Box3().setFromObject(new THREE.Mesh(geometry)).getBoundingSphere(sphere);
-    camera.position.set(0,0,sphere.radius*2.5);
-    const mesh = new THREE.LineSegments(new THREE.WireframeGeometry(geometry), new THREE.LineBasicMaterial({ color:0x00ff88 }));
+    new THREE.Box3().setFromObject(new THREE.Mesh(geo)).getBoundingSphere(sphere);
+    cam.position.set(0, 0, sphere.radius * 2.8);
+    const mesh = new THREE.LineSegments(
+      new THREE.WireframeGeometry(geo),
+      new THREE.LineBasicMaterial({ color: 0x00ff88 })
+    );
     scene.add(mesh);
-    scene.add(new THREE.AmbientLight(0xffffff,1));
-    const animate = () => { previewAnimRef.current = requestAnimationFrame(animate); mesh.rotation.y += 0.01; renderer.render(scene,camera); };
-    animate();
+    scene.add(new THREE.AmbientLight(0xffffff, 1));
+    const loop = () => {
+      previewAnimRef.current = requestAnimationFrame(loop);
+      mesh.rotation.y += 0.012;
+      mesh.rotation.x = Math.sin(Date.now() * 0.0005) * 0.3;
+      renderer.render(scene, cam);
+    };
+    loop();
   }
 
-  // ── CAMERA ──
-  async function startCamera() {
-    setCamError(null);
+  // ── START WebXR AR SESSION ──
+  async function startAR() {
+    setArError(null);
+    const THREE = window.THREE;
+
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video:{ facingMode:"environment", width:{ideal:1280}, height:{ideal:720} }, audio:false
+      // ── Init Three.js renderer on the canvas ──
+      const canvas = canvasRef.current;
+      if (rendererRef.current) { rendererRef.current.dispose(); }
+
+      const renderer = new THREE.WebGLRenderer({
+        canvas, alpha: true, antialias: true,
+        powerPreference: "high-performance"
       });
-      streamRef.current = stream;
-      setStep("camera");
-      setTimeout(() => initCameraOverlay(stream), 100);
+      renderer.setPixelRatio(window.devicePixelRatio);
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.xr.enabled = true;
+      renderer.setClearColor(0x000000, 0);
+      rendererRef.current = renderer;
+
+      // ── Scene setup ──
+      const scene = new THREE.Scene();
+      sceneRef.current = scene;
+
+      // Lighting
+      scene.add(new THREE.AmbientLight(0xffffff, 0.8));
+      const dirLight = new THREE.DirectionalLight(0xffffff, 0.6);
+      dirLight.position.set(1, 2, 3);
+      scene.add(dirLight);
+
+      // Camera (WebXR will control this)
+      const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 100);
+      cameraRef.current = camera;
+
+      // ── STL Wireframe Mesh ──
+      const geo = geometryRef.current;
+      geo.computeBoundingBox();
+      const bb = geo.boundingBox;
+      const maxDim = Math.max(bb.max.x-bb.min.x, bb.max.y-bb.min.y, bb.max.z-bb.min.z);
+      // Scale so model ≈ 0.3 meters in real world
+      const worldScale = 0.3 / maxDim;
+
+      const wireGeo = new THREE.WireframeGeometry(geo);
+      const wireMat = new THREE.LineBasicMaterial({ color: 0x00ff00, linewidth: 1.5 });
+      const mesh = new THREE.LineSegments(wireGeo, wireMat);
+      mesh.scale.setScalar(worldScale);
+      mesh.visible = false; // hidden until placed
+      scene.add(mesh);
+      meshRef.current = mesh;
+
+      // Axes helper on model
+      const axes = new THREE.AxesHelper(0.15);
+      mesh.add(axes);
+
+      // ── Reticle (placement target) ──
+      const reticleGeo = new THREE.RingGeometry(0.08, 0.12, 32);
+      reticleGeo.applyMatrix4(new THREE.Matrix4().makeRotationX(-Math.PI / 2));
+      const reticleMat = new THREE.MeshBasicMaterial({ color: 0x00ff88, side: THREE.DoubleSide });
+      const reticle = new THREE.Mesh(reticleGeo, reticleMat);
+      reticle.visible = false;
+      scene.add(reticle);
+      reticleMeshRef.current = reticle;
+
+      // ── Request WebXR session ──
+      const session = await navigator.xr.requestSession("immersive-ar", {
+        requiredFeatures: ["hit-test"],
+        optionalFeatures: ["dom-overlay", "anchors"],
+        domOverlay: { root: document.getElementById("ar-overlay") }
+      });
+      xrSessionRef.current = session;
+
+      renderer.xr.setReferenceSpaceType("local");
+      await renderer.xr.setSession(session);
+
+      // ── Reference space ──
+      const refSpace = await session.requestReferenceSpace("local");
+      xrRefSpaceRef.current = refSpace;
+
+      // ── Hit test source ──
+      const viewerSpace = await session.requestReferenceSpace("viewer");
+      const hitTestSrc = await session.requestHitTestSource({ space: viewerSpace });
+      hitTestSrcRef.current = hitTestSrc;
+
+      // ── Set initial transform ──
+      transformRef.current = { scale: worldScale, rotY: 0 };
+      setTransform({ scale: worldScale, rotY: 0 });
+      placedRef.current = false;
+      setIsPlaced(false);
+      setScanning(true);
+
+      setStep("ar");
+
+      // ── XR Render Loop ──
+      renderer.setAnimationLoop((timestamp, frame) => {
+        if (!frame) return;
+
+        const session = xrSessionRef.current;
+        const refSpace = xrRefSpaceRef.current;
+        const hitSrc = hitTestSrcRef.current;
+
+        // ── Hit test — move reticle ──
+        if (hitSrc && !placedRef.current) {
+          const hits = frame.getHitTestResults(hitSrc);
+          if (hits.length > 0) {
+            const hit = hits[0];
+            const pose = hit.getPose(refSpace);
+            if (pose) {
+              reticle.visible = true;
+              reticle.matrix.fromArray(pose.transform.matrix);
+              reticle.matrixAutoUpdate = false;
+              setHitAvailable(true);
+              setScanning(false);
+            }
+          } else {
+            reticle.visible = false;
+            setHitAvailable(false);
+          }
+        }
+
+        // ── Apply WebXR camera pose to Three.js camera ──
+        const pose = frame.getViewerPose(refSpace);
+        if (pose) {
+          const view = pose.views[0];
+          // Use real camera projection matrix from device
+          camera.projectionMatrix.fromArray(view.projectionMatrix);
+          camera.projectionMatrixInverse.copy(camera.projectionMatrix).invert();
+          // Use real camera world transform
+          const viewMatrix = view.transform.inverse.matrix;
+          camera.matrix.fromArray(view.transform.matrix);
+          camera.matrixWorldNeedsUpdate = true;
+        }
+
+        renderer.render(scene, camera);
+      });
+
+      session.addEventListener("end", () => {
+        cleanupAR();
+        setStep("upload");
+        setToast({ message: "AR session ended", type: "info" });
+      });
+
     } catch(err) {
-      setCamError(err.name === "NotAllowedError"
-        ? "Camera permission denied. Allow camera access in browser settings and reload."
-        : "Could not access camera: " + err.message);
+      console.error("WebXR error:", err);
+      setArError(
+        err.name === "NotSupportedError" ? "AR not supported on this device." :
+        err.name === "SecurityError" ? "HTTPS required for AR. Use ngrok or deploy to HTTPS." :
+        err.name === "NotAllowedError" ? "Camera permission denied." :
+        "AR failed: " + err.message
+      );
     }
   }
 
-  function initCameraOverlay(stream) {
+  // ── PLACE MODEL on tap ──
+  function placeModel() {
+    const reticle = reticleMeshRef.current;
+    const mesh = meshRef.current;
+    if (!reticle || !reticle.visible || !mesh) return;
+
+    // Copy reticle world matrix to mesh position
     const THREE = window.THREE;
-    const video = videoRef.current;
-    const canvas = overlayCanvasRef.current;
-    if (!video || !canvas) return;
-    video.srcObject = stream; video.play();
-    const W = window.innerWidth, H = window.innerHeight;
-    if (rendererOverlayRef.current) rendererOverlayRef.current.dispose();
-    const renderer = new THREE.WebGLRenderer({ canvas, alpha:true, antialias:true });
-    renderer.setSize(W,H); renderer.setPixelRatio(window.devicePixelRatio);
-    renderer.setClearColor(0x000000,0);
-    rendererOverlayRef.current = renderer;
-    const scene = new THREE.Scene(); sceneRef.current = scene;
-    const cam = new THREE.PerspectiveCamera(45,W/H,0.01,1000);
-    cam.position.set(0,0,5); cameraRef.current = cam;
-    const geometry = geometryRef.current;
-    geometry.computeBoundingBox();
-    const bb = geometry.boundingBox;
-    const size = Math.max(bb.max.x-bb.min.x, bb.max.y-bb.min.y, bb.max.z-bb.min.z);
-    const targetScale = (H * 0.3) / (size * 100);
-    const mesh = new THREE.LineSegments(
-      new THREE.WireframeGeometry(geometry),
-      new THREE.LineBasicMaterial({ color:0x00ff00, linewidth:1.5 })
-    );
-    mesh.scale.setScalar(targetScale);
-    scene.add(mesh); meshRef.current = mesh;
-    scene.add(new THREE.AxesHelper(0.5));
-    scene.add(new THREE.AmbientLight(0xffffff,1));
-    transformRef.current = { x:0, y:0, scale:targetScale, rotX:0, rotY:0, rotZ:0 };
-    setTransform({ ...transformRef.current });
-    cancelAnimationFrame(animFrameRef.current);
-    const loop = () => { animFrameRef.current = requestAnimationFrame(loop); renderer.render(scene,cam); };
-    loop();
-    const onResize = () => {
-      const w=window.innerWidth, h=window.innerHeight;
-      renderer.setSize(w,h); cam.aspect=w/h; cam.updateProjectionMatrix();
-    };
-    window.addEventListener("resize", onResize);
+    const pos = new THREE.Vector3();
+    const quat = new THREE.Quaternion();
+    const scale = new THREE.Vector3();
+    reticle.matrix.decompose(pos, quat, scale);
+
+    mesh.position.copy(pos);
+    mesh.quaternion.copy(quat);
+    mesh.scale.setScalar(transformRef.current.scale);
+    mesh.rotation.y += transformRef.current.rotY;
+    mesh.visible = true;
+
+    reticle.visible = false;
+    placedRef.current = true;
+    setIsPlaced(true);
+    setHitAvailable(false);
+    setToast({ message: "✅ Model placed! Adjust with gestures.", type: "success" });
   }
 
-  // ── GESTURES ──
+  // ── REPOSITION (move model again) ──
+  function repositionModel() {
+    const mesh = meshRef.current;
+    const reticle = reticleMeshRef.current;
+    if (!mesh || !reticle) return;
+    mesh.visible = false;
+    reticle.visible = false;
+    placedRef.current = false;
+    setIsPlaced(false);
+    setScanning(true);
+    setHitAvailable(false);
+    setToast({ message: "Move camera to scan surface", type: "info" });
+  }
+
+  // ── GESTURES (after placement) ──
   useEffect(() => {
-    if (step !== "camera" && step !== "tracking") return;
-    const el = gestureRef.current;
-    if (!el) return;
-    const onPD = (e) => {
-      if (e.button === 2) { rightClickRef.current=true; shiftRef.current=e.shiftKey; ctrlRef.current=e.ctrlKey; lastPointerRef.current={x:e.clientX,y:e.clientY}; return; }
-      isDraggingRef.current=true; lastPointerRef.current={x:e.clientX,y:e.clientY};
-    };
-    const onPM = (e) => {
-      const dx=e.clientX-lastPointerRef.current.x, dy=e.clientY-lastPointerRef.current.y;
-      lastPointerRef.current={x:e.clientX,y:e.clientY};
-      const mesh=meshRef.current; if(!mesh) return;
-      if (rightClickRef.current) {
-        const s=0.005;
-        if (shiftRef.current) mesh.rotation.x+=dy*s;
-        else if (ctrlRef.current) mesh.rotation.z+=dx*s;
-        else mesh.rotation.y+=dx*s;
-        transformRef.current.rotX=mesh.rotation.x; transformRef.current.rotY=mesh.rotation.y; transformRef.current.rotZ=mesh.rotation.z;
-        setTransform({...transformRef.current}); return;
-      }
-      if (isDraggingRef.current) {
-        const cam=cameraRef.current;
-        const f=(2*Math.tan((cam.fov*Math.PI/180)/2)*cam.position.z)/window.innerHeight;
-        mesh.position.x+=dx*f; mesh.position.y-=dy*f;
-        transformRef.current.x=mesh.position.x; transformRef.current.y=mesh.position.y;
-        setTransform({...transformRef.current});
-      }
-    };
-    const onPU = () => { isDraggingRef.current=false; rightClickRef.current=false; };
-    const onCM = (e) => e.preventDefault();
-    const onW = (e) => {
-      e.preventDefault();
-      const mesh=meshRef.current; if(!mesh) return;
-      const r=e.deltaY>0?0.95:1.05;
-      const ns=transformRef.current.scale*r;
-      mesh.scale.setScalar(ns); transformRef.current.scale=ns; setTransform({...transformRef.current});
-    };
+    if (step !== "ar") return;
+    const el = gestureLayerRef.current; if (!el) return;
+
     const onTS = (e) => {
-      if (e.touches.length===1) lastPointerRef.current={x:e.touches[0].clientX,y:e.touches[0].clientY};
-      if (e.touches.length===2) {
-        const dx=e.touches[1].clientX-e.touches[0].clientX, dy=e.touches[1].clientY-e.touches[0].clientY;
-        lastPinchRef.current=Math.hypot(dx,dy); lastTwoFingerAngleRef.current=Math.atan2(dy,dx);
+      if (e.touches.length === 1) {
+        lastTouchRef.current = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+      } else if (e.touches.length === 2) {
+        const dx = e.touches[1].clientX - e.touches[0].clientX;
+        const dy = e.touches[1].clientY - e.touches[0].clientY;
+        lastPinchRef.current = Math.hypot(dx, dy);
+        lastAngleRef.current = Math.atan2(dy, dx);
       }
     };
+
     const onTM = (e) => {
       e.preventDefault();
-      const mesh=meshRef.current; if(!mesh) return;
-      if (e.touches.length===1) {
-        const dx=e.touches[0].clientX-lastPointerRef.current.x, dy=e.touches[0].clientY-lastPointerRef.current.y;
-        lastPointerRef.current={x:e.touches[0].clientX,y:e.touches[0].clientY};
-        const cam=cameraRef.current;
-        const f=(2*Math.tan((cam.fov*Math.PI/180)/2)*cam.position.z)/window.innerHeight;
-        mesh.position.x+=dx*f; mesh.position.y-=dy*f;
-        transformRef.current.x=mesh.position.x; transformRef.current.y=mesh.position.y;
-        setTransform({...transformRef.current});
-      } else if (e.touches.length===2) {
-        const dx=e.touches[1].clientX-e.touches[0].clientX, dy=e.touches[1].clientY-e.touches[0].clientY;
-        const dist=Math.hypot(dx,dy), angle=Math.atan2(dy,dx);
-        if (lastPinchRef.current) { const r=dist/lastPinchRef.current; const ns=transformRef.current.scale*r; mesh.scale.setScalar(ns); transformRef.current.scale=ns; }
-        if (lastTwoFingerAngleRef.current!==null) { mesh.rotation.y+=angle-lastTwoFingerAngleRef.current; transformRef.current.rotY=mesh.rotation.y; }
-        lastPinchRef.current=dist; lastTwoFingerAngleRef.current=angle;
-        setTransform({...transformRef.current});
-      }
-    };
-    el.addEventListener("pointerdown",onPD); el.addEventListener("pointermove",onPM);
-    el.addEventListener("pointerup",onPU); el.addEventListener("contextmenu",onCM);
-    el.addEventListener("wheel",onW,{passive:false});
-    el.addEventListener("touchstart",onTS,{passive:false}); el.addEventListener("touchmove",onTM,{passive:false});
-    return () => {
-      el.removeEventListener("pointerdown",onPD); el.removeEventListener("pointermove",onPM);
-      el.removeEventListener("pointerup",onPU); el.removeEventListener("contextmenu",onCM);
-      el.removeEventListener("wheel",onW);
-      el.removeEventListener("touchstart",onTS); el.removeEventListener("touchmove",onTM);
-    };
-  }, [step]);
+      const mesh = meshRef.current;
+      if (!mesh || !placedRef.current) return;
 
-  // ── CAPTURE REFERENCE ──
-  function captureReference() {
-    if (!cvReady || !window.cv) return;
-    const cv = window.cv;
-    const video = videoRef.current; if(!video) return;
-    const snap = document.createElement("canvas");
-    snap.width=video.videoWidth||640; snap.height=video.videoHeight||480;
-    snap.getContext("2d").drawImage(video,0,0);
-    let src, gray, kps, desc, mask;
-    try {
-      src=cv.imread(snap); gray=new cv.Mat();
-      cv.cvtColor(src,gray,cv.COLOR_RGBA2GRAY);
-      const orb=new cv.ORB(500); orbRef.current=orb;
-      kps=new cv.KeyPointVector(); desc=new cv.Mat(); mask=new cv.Mat();
-      orb.detectAndCompute(gray,mask,kps,desc);
-      const count=kps.size();
-      if (count<8) {
-        setToast({message:"⚠️ Too few features. Try better lighting.",type:"warn"});
-        src.delete(); gray.delete(); kps.delete(); desc.delete(); mask.delete(); return;
-      }
-      refDataRef.current={descriptors:desc, keypoints:kps, transform:{...transformRef.current}};
-      setToast({message:`🔒 Lock Acquired — ${count} keypoints`,type:"success"});
-      setStep("tracking"); setTrackingState("active");
-      src.delete(); gray.delete(); mask.delete();
-    } catch(e) {
-      console.error("Ref capture error",e);
-      try{src?.delete();gray?.delete();kps?.delete();desc?.delete();mask?.delete();}catch{}
-      setToast({message:"❌ Failed to capture reference frame.",type:"error"});
-    }
-  }
+      if (e.touches.length === 1 && lastTouchRef.current) {
+        // Single drag = rotate Y
+        const dx = e.touches[0].clientX - lastTouchRef.current.x;
+        mesh.rotation.y += dx * 0.01;
+        transformRef.current.rotY = mesh.rotation.y;
+        lastTouchRef.current = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+        setTransform(t => ({ ...t, rotY: mesh.rotation.y }));
 
-  // ── TRACKING LOOP ──
-  useEffect(() => {
-    if (step!=="tracking") return;
-    const cv=window.cv; if(!cv) return;
-    let running=true, frameCount=0;
-    const video=videoRef.current;
-    const trackLoop = () => {
-      if(!running) return;
-      animFrameRef.current=requestAnimationFrame(trackLoop);
-      frameCount++;
-      if(frameCount%3!==0) return;
-      const ref=refDataRef.current; const orb=orbRef.current;
-      if(!ref||!orb||!video||video.readyState<2) return;
-      let curGray, curKps, curDesc, mask, matches;
-      try {
-        const snap=document.createElement("canvas");
-        snap.width=video.videoWidth||640; snap.height=video.videoHeight||480;
-        snap.getContext("2d").drawImage(video,0,0);
-        const src=cv.imread(snap); curGray=new cv.Mat();
-        cv.cvtColor(src,curGray,cv.COLOR_RGBA2GRAY); src.delete();
-        curKps=new cv.KeyPointVector(); curDesc=new cv.Mat(); mask=new cv.Mat();
-        orb.detectAndCompute(curGray,mask,curKps,curDesc);
-        curGray.delete(); mask.delete();
-        if(curDesc.rows===0){setTrackingState("lost");setMatchCount(0);curKps.delete();curDesc.delete();return;}
-        const matcher=new cv.BFMatcher(cv.NORM_HAMMING,false);
-        matches=new cv.DMatchVectorVector();
-        matcher.knnMatch(ref.descriptors,curDesc,matches,2);
-        const good=[];
-        for(let i=0;i<matches.size();i++){
-          const m=matches.get(i);
-          if(m.size()>=2&&m.get(0).distance<0.75*m.get(1).distance)
-            good.push({qi:m.get(0).queryIdx,ti:m.get(0).trainIdx});
+      } else if (e.touches.length === 2) {
+        const dx = e.touches[1].clientX - e.touches[0].clientX;
+        const dy = e.touches[1].clientY - e.touches[0].clientY;
+        const dist = Math.hypot(dx, dy);
+        const angle = Math.atan2(dy, dx);
+
+        if (lastPinchRef.current) {
+          const ratio = dist / lastPinchRef.current;
+          const ns = transformRef.current.scale * ratio;
+          if (ns > 0.001 && ns < 10) {
+            mesh.scale.setScalar(ns);
+            transformRef.current.scale = ns;
+            setTransform(t => ({ ...t, scale: ns }));
+          }
         }
-        matches.delete();
-        setMatchCount(good.length);
-        if(good.length>=8){
-          const sp=[],dp=[];
-          for(const g of good){
-            const rk=ref.keypoints.get(g.qi); const ck=curKps.get(g.ti);
-            sp.push(rk.pt.x,rk.pt.y); dp.push(ck.pt.x,ck.pt.y);
-          }
-          const sM=cv.matFromArray(good.length,1,cv.CV_32FC2,sp);
-          const dM=cv.matFromArray(good.length,1,cv.CV_32FC2,dp);
-          const H=cv.findHomography(sM,dM,cv.RANSAC,3.0);
-          sM.delete(); dM.delete();
-          if(H&&!H.empty()){
-            const h=H.data64F;
-            const dx=(h[2]-(snap.width/2))/(snap.width/2);
-            const dy=-(h[5]-(snap.height/2))/(snap.height/2);
-            const sx=Math.sqrt(h[0]*h[0]+h[3]*h[3]);
-            const sy=Math.sqrt(h[1]*h[1]+h[4]*h[4]);
-            const avgScale=(sx+sy)/2;
-            const rotation=Math.atan2(h[3],h[0]);
-            const mesh=meshRef.current; const cam=cameraRef.current;
-            if(mesh&&cam){
-              const fov=2*Math.tan((cam.fov*Math.PI/180)/2)*cam.position.z;
-              const bt=ref.transform;
-              mesh.position.x=bt.x+dx*fov*0.5;
-              mesh.position.y=bt.y+dy*fov*0.5;
-              const ns=bt.scale*avgScale;
-              if(ns>0.00001&&ns<100) mesh.scale.setScalar(ns);
-              mesh.rotation.y=bt.rotY+rotation;
-              transformRef.current={...transformRef.current,x:mesh.position.x,y:mesh.position.y,scale:mesh.scale.x,rotY:mesh.rotation.y};
-            }
-            H.delete();
-          }
-          setTrackingState("active");
-        } else { setTrackingState("lost"); }
-        curKps.delete(); curDesc.delete();
-      } catch(e) {
-        console.error("Tracking error",e);
-        try{curGray?.delete();curKps?.delete();curDesc?.delete();mask?.delete();matches?.delete();}catch{}
-        setTrackingState("lost");
+        lastPinchRef.current = dist;
+        lastAngleRef.current = angle;
       }
     };
-    trackLoop();
-    return () => { running=false; };
+
+    const onTE = () => {
+      lastTouchRef.current = null;
+      lastPinchRef.current = null;
+      lastAngleRef.current = null;
+    };
+
+    el.addEventListener("touchstart", onTS, { passive: false });
+    el.addEventListener("touchmove", onTM, { passive: false });
+    el.addEventListener("touchend", onTE);
+    return () => {
+      el.removeEventListener("touchstart", onTS);
+      el.removeEventListener("touchmove", onTM);
+      el.removeEventListener("touchend", onTE);
+    };
   }, [step]);
 
-  function stopTracking() {
-    setTrackingState("idle"); setStep("camera");
-    if(refDataRef.current){
-      try{refDataRef.current.descriptors?.delete();refDataRef.current.keypoints?.delete();}catch{}
-      refDataRef.current=null;
+  // ── CLEANUP ──
+  function cleanupAR() {
+    if (rendererRef.current) {
+      rendererRef.current.setAnimationLoop(null);
+      rendererRef.current.dispose();
+      rendererRef.current = null;
     }
-  }
-
-  function cleanupAll() {
-    cancelAnimationFrame(animFrameRef.current);
+    if (hitTestSrcRef.current) { try { hitTestSrcRef.current.cancel(); } catch{} hitTestSrcRef.current = null; }
+    if (xrSessionRef.current) { try { xrSessionRef.current.end(); } catch{} xrSessionRef.current = null; }
     cancelAnimationFrame(previewAnimRef.current);
-    streamRef.current?.getTracks().forEach(t=>t.stop());
-    rendererOverlayRef.current?.dispose();
-    rendererPreviewRef.current?.dispose();
-    try{refDataRef.current?.descriptors?.delete();refDataRef.current?.keypoints?.delete();}catch{}
+    if (rendererPreviewRef.current) { rendererPreviewRef.current.dispose(); rendererPreviewRef.current = null; }
   }
 
-  const onDrop=(e)=>{e.preventDefault();handleFileSelect(e.dataTransfer.files[0]);};
+  const onDrop = (e) => { e.preventDefault(); handleFile(e.dataTransfer.files[0]); };
 
-  // ── UPLOAD SCREEN ──
-  if (step==="upload") return (
-    <div style={{minHeight:"100vh",background:"#0a0a0a",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:24,fontFamily:"'Courier New',monospace"}}>
+  // ─────────────────────────────────────────────
+  // ── RENDER: UPLOAD SCREEN ──
+  // ─────────────────────────────────────────────
+  if (step === "upload") return (
+    <div style={{
+      minHeight:"100vh", background:"#080c08",
+      display:"flex", flexDirection:"column", alignItems:"center",
+      justifyContent:"center", padding:"24px 16px",
+      fontFamily:"'JetBrains Mono','Courier New',monospace"
+    }}>
       <style>{`
-        @keyframes fadeInDown{from{opacity:0;transform:translate(-50%,-10px)}to{opacity:1;transform:translate(-50%,0)}}
-        @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}
-        @keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
-        .dz:hover{border-color:#00ff88!important;background:rgba(0,255,136,0.05)!important;}
-        .btn-green:hover{background:#00cc6a!important;}
-        .btn-green:active{transform:scale(0.97);}
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;700&display=swap');
+        @keyframes toastIn { from{opacity:0;transform:translate(-50%,-12px) scale(0.9)} to{opacity:1;transform:translate(-50%,0) scale(1)} }
+        @keyframes scanRing { 0%{transform:scale(0.4);opacity:0.8} 100%{transform:scale(2);opacity:0} }
+        @keyframes spin { from{transform:rotate(0)} to{transform:rotate(360deg)} }
+        @keyframes fadeUp { from{opacity:0;transform:translateY(16px)} to{opacity:1;transform:translateY(0)} }
+        @keyframes gridPulse { 0%,100%{opacity:0.03} 50%{opacity:0.07} }
+        .dz:hover { border-color:#00ff88 !important; background:rgba(0,255,136,0.04) !important; }
+        .dz:hover .dz-icon { color:#00ff88 !important; transform:scale(1.1); }
+        .btn-ar { transition:all 0.2s; }
+        .btn-ar:hover { background:#00cc6a !important; transform:translateY(-1px); box-shadow:0 8px 24px rgba(0,255,136,0.3) !important; }
+        .btn-ar:active { transform:scale(0.97); }
       `}</style>
-      {toast && <Toast {...toast} onDone={()=>setToast(null)} />}
 
-      <div style={{marginBottom:40,textAlign:"center"}}>
-        <div style={{fontSize:10,letterSpacing:5,color:"#00ff88",marginBottom:8}}>CAD OVERLAY SYSTEM</div>
-        <h1 style={{fontSize:26,color:"#fff",margin:0,fontWeight:400,letterSpacing:3}}>
-          MODEL ALIGNMENT <span style={{color:"#00ff88"}}>v1.0</span>
-        </h1>
-        <p style={{color:"#555",fontSize:11,marginTop:8,letterSpacing:1}}>STL → CAMERA → ALIGN → TRACK</p>
-      </div>
+      {/* Grid background */}
+      <div style={{
+        position:"fixed", inset:0, zIndex:0, pointerEvents:"none",
+        backgroundImage:"linear-gradient(rgba(0,255,136,0.05) 1px,transparent 1px),linear-gradient(90deg,rgba(0,255,136,0.05) 1px,transparent 1px)",
+        backgroundSize:"40px 40px", animation:"gridPulse 4s ease-in-out infinite"
+      }} />
 
-      <div className="dz" onDrop={onDrop} onDragOver={e=>e.preventDefault()}
-        onClick={()=>document.getElementById("stl-input").click()}
-        style={{width:"100%",maxWidth:440,border:"1px dashed #333",borderRadius:12,padding:"32px 24px",textAlign:"center",cursor:"pointer",background:"#111",transition:"all 0.2s"}}>
-        <input id="stl-input" type="file" accept=".stl" style={{display:"none"}} onChange={e=>handleFileSelect(e.target.files[0])} />
+      {toast && <Toast {...toast} onDone={() => setToast(null)} />}
 
-        {!parseInfo ? (
-          <>
-            <div style={{fontSize:48,marginBottom:12,color:"#00ff88",lineHeight:1}}>⬡</div>
-            <div style={{color:"#666",fontSize:13,lineHeight:1.8}}>
-              Drop <span style={{color:"#00ff88"}}>.stl</span> file here<br/>
-              <span style={{color:"#444",fontSize:11}}>or click to browse</span>
+      <div style={{ position:"relative", zIndex:1, width:"100%", maxWidth:460, animation:"fadeUp 0.6s ease" }}>
+
+        {/* Header */}
+        <div style={{ textAlign:"center", marginBottom:36 }}>
+          <div style={{ fontSize:10, letterSpacing:6, color:"#00ff8899", marginBottom:10 }}>
+            WEBXR · ARCORE · ARKIT
+          </div>
+          <h1 style={{ fontSize:24, color:"#fff", margin:0, fontWeight:300, letterSpacing:4, lineHeight:1.3 }}>
+            CAD <span style={{ color:"#00ff88", fontWeight:700 }}>OVERLAY</span>
+          </h1>
+          <p style={{ color:"#445", fontSize:10, marginTop:8, letterSpacing:2 }}>
+            REAL-WORLD AR · STL ALIGNMENT
+          </p>
+        </div>
+
+        {/* Drop zone */}
+        <div className="dz" onDrop={onDrop} onDragOver={e=>e.preventDefault()}
+          onClick={() => document.getElementById("stl-input").click()}
+          style={{
+            border:"1px dashed #1e3a1e", borderRadius:16, padding:"28px 20px",
+            textAlign:"center", cursor:"pointer", background:"#0a120a",
+            transition:"all 0.25s", marginBottom:16
+          }}>
+          <input id="stl-input" type="file" accept=".stl" style={{ display:"none" }}
+            onChange={e => handleFile(e.target.files[0])} />
+
+          {!parseInfo ? (
+            <>
+              <div className="dz-icon" style={{ fontSize:44, color:"#1e4a1e", marginBottom:14, transition:"all 0.2s" }}>⬡</div>
+              <div style={{ color:"#446644", fontSize:12, lineHeight:2, letterSpacing:1 }}>
+                DROP <span style={{ color:"#00ff88" }}>.STL</span> FILE HERE<br/>
+                <span style={{ color:"#2a3a2a", fontSize:10 }}>or click to browse</span>
+              </div>
+              {!threeReady && (
+                <div style={{ marginTop:14, fontSize:10, color:"#446644", display:"flex", alignItems:"center", justifyContent:"center", gap:6 }}>
+                  <span style={{ animation:"spin 1s linear infinite", display:"inline-block" }}>◌</span>
+                  LOADING 3D ENGINE
+                </div>
+              )}
+            </>
+          ) : (
+            <div onClick={e => e.stopPropagation()}>
+              <canvas ref={previewCanvasRef} width={280} height={280}
+                style={{ borderRadius:10, display:"block", margin:"0 auto 14px", background:"transparent" }} />
+              <div style={{ color:"#fff", fontSize:12, marginBottom:4, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
+                {parseInfo.name}
+              </div>
+              <div style={{ color:"#00ff88", fontSize:11, lineHeight:2 }}>
+                {parseInfo.tris.toLocaleString()} triangles
+              </div>
+              <div style={{ color:"#445", fontSize:10 }}>
+                {parseInfo.w} × {parseInfo.h} × {parseInfo.d} mm
+              </div>
+              <div style={{ marginTop:10, fontSize:9, color:"#2a3a2a", borderTop:"1px solid #1a2a1a", paddingTop:10 }}>
+                CLICK TO REPLACE
+              </div>
             </div>
-            {!threeReady&&(
-              <div style={{marginTop:12,fontSize:11,color:"#555"}}>
-                <span style={{display:"inline-block",animation:"spin 1s linear infinite",marginRight:6}}>◌</span>
-                Loading 3D engine...
+          )}
+          {parseError && <div style={{ marginTop:10, color:"#ff6644", fontSize:11 }}>{parseError}</div>}
+        </div>
+
+        {/* WebXR support status */}
+        <div style={{ textAlign:"center", marginBottom:16 }}>
+          {xrSupported === null && (
+            <div style={{ color:"#445", fontSize:10, letterSpacing:1 }}>
+              <span style={{ animation:"spin 1s linear infinite", display:"inline-block", marginRight:6 }}>◌</span>
+              CHECKING AR SUPPORT
+            </div>
+          )}
+          {xrSupported === true && (
+            <div style={{ color:"#00ff88", fontSize:10, letterSpacing:1 }}>✓ AR SUPPORTED ON THIS DEVICE</div>
+          )}
+          {xrSupported === false && (
+            <div style={{ color:"#ff6644", fontSize:10, letterSpacing:1, lineHeight:1.8 }}>
+              ⚠ WebXR AR not supported<br/>
+              <span style={{ color:"#445", fontSize:9 }}>
+                Requires Android Chrome 81+ or iOS Safari 16+<br/>
+                and HTTPS (use ngrok for local testing)
+              </span>
+            </div>
+          )}
+        </div>
+
+        {/* Start AR button */}
+        {parseInfo && (
+          <button className="btn-ar" onClick={startAR}
+            disabled={xrSupported === false}
+            style={{
+              width:"100%", padding:"16px", borderRadius:10,
+              background: xrSupported === false ? "#1a2a1a" : "#00ff88",
+              color: xrSupported === false ? "#445" : "#000",
+              border:"none", fontSize:13, fontWeight:700, cursor: xrSupported === false ? "not-allowed" : "pointer",
+              letterSpacing:3, fontFamily:"'JetBrains Mono',monospace",
+              boxShadow: xrSupported !== false ? "0 4px 20px rgba(0,255,136,0.2)" : "none"
+            }}>
+            {xrSupported === false ? "AR NOT AVAILABLE" : "▶  LAUNCH AR"}
+          </button>
+        )}
+
+        {arError && (
+          <div style={{
+            marginTop:14, background:"#1a0a0a", border:"1px solid #ff444444",
+            borderRadius:10, padding:"12px 16px", color:"#ff6644", fontSize:11, lineHeight:1.8
+          }}>
+            {arError}
+            {arError.includes("ngrok") && (
+              <div style={{ marginTop:8, color:"#445", fontSize:10 }}>
+                Run: <span style={{ color:"#00ff88" }}>npx ngrok http 5173</span><br/>
+                Then open the https:// URL on your phone
               </div>
             )}
-          </>
-        ):(
-          <div onClick={e=>e.stopPropagation()}>
-            <canvas ref={previewCanvasRef} width={300} height={300} style={{borderRadius:8,background:"transparent",display:"block",margin:"0 auto 16px"}} />
-            <div style={{color:"#fff",fontSize:13,marginBottom:4,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{parseInfo.name}</div>
-            <div style={{color:"#00ff88",fontSize:11,lineHeight:2}}>
-              {parseInfo.triangles.toLocaleString()} triangles
-            </div>
-            <div style={{color:"#555",fontSize:11}}>{parseInfo.w} × {parseInfo.h} × {parseInfo.d} mm</div>
-            <div style={{marginTop:10,fontSize:10,color:"#444",borderTop:"1px solid #222",paddingTop:10}}>
-              Click to replace file
-            </div>
           </div>
         )}
-        {parseError&&<div style={{marginTop:12,color:"#ff4444",fontSize:12}}>{parseError}</div>}
-      </div>
 
-      <div style={{marginTop:14,fontSize:11,color:cvReady?"#00ff88":cvError?"#ff6644":"#444",display:"flex",alignItems:"center",gap:6}}>
-        {cvReady ? <>✓ CV engine ready</>
-          : cvError ? <>⚠ CV engine unavailable — tracking disabled</>
-          : <><span style={{display:"inline-block",animation:"spin 1s linear infinite"}}>◌</span> Loading CV engine...</>
-        }
-      </div>
-
-      {parseInfo&&(
-        <button className="btn-green" onClick={startCamera} style={{marginTop:24,padding:"14px 48px",background:"#00ff88",color:"#000",border:"none",borderRadius:8,fontSize:13,fontWeight:700,cursor:"pointer",letterSpacing:2,fontFamily:"monospace",transition:"all 0.2s"}}>
-          OPEN CAMERA →
-        </button>
-      )}
-      {camError&&(
-        <div style={{marginTop:16,background:"#1a0000",border:"1px solid #ff4444",borderRadius:8,padding:"12px 16px",maxWidth:440,color:"#ff4444",fontSize:12,lineHeight:1.6}}>
-          {camError}
-        </div>
-      )}
-    </div>
-  );
-
-  // ── CAMERA/TRACKING SCREEN ──
-  const tColor = trackingState==="active"?"#00ff88":trackingState==="lost"?"#ffcc00":"#555";
-  const tLabel = trackingState==="active"?`TRACKING — ${matchCount} pts`:trackingState==="lost"?"LOST — Move back to object":"NOT TRACKING";
-
-  return (
-    <div style={{position:"relative",width:"100vw",height:"100vh",overflow:"hidden",background:"#000"}}>
-      <style>{`
-        @keyframes fadeInDown{from{opacity:0;transform:translate(-50%,-10px)}to{opacity:1;transform:translate(-50%,0)}}
-        @keyframes pulse{0%,100%{opacity:1;box-shadow:0 0 8px #00ff88}50%{opacity:0.5;box-shadow:0 0 20px #00ff88}}
-        @keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
-        @keyframes dotPulse{0%,100%{transform:scale(1)}50%{transform:scale(1.4)}}
-      `}</style>
-      {toast&&<Toast {...toast} onDone={()=>setToast(null)} />}
-
-      {/* VIDEO */}
-      <video ref={videoRef} autoPlay playsInline muted style={{position:"absolute",inset:0,width:"100%",height:"100%",objectFit:"cover"}} />
-
-      {/* THREE.JS OVERLAY */}
-      <canvas ref={overlayCanvasRef} style={{position:"absolute",inset:0,pointerEvents:"none"}} />
-
-      {/* GESTURE LAYER */}
-      <div ref={gestureRef} style={{position:"absolute",inset:0,touchAction:"none"}} />
-
-      {/* TOP BAR */}
-      <div style={{position:"absolute",top:0,left:0,right:0,background:"rgba(0,0,0,0.65)",backdropFilter:"blur(10px)",padding:"10px 16px",display:"flex",alignItems:"center",justifyContent:"space-between",zIndex:10,borderBottom:"1px solid #1a1a1a"}}>
-        <div style={{color:"#00ff88",fontSize:10,letterSpacing:4,fontFamily:"monospace"}}>CAD OVERLAY</div>
-        <div style={{display:"flex",gap:10,fontSize:10,fontFamily:"monospace",color:"#00ff88"}}>
-          {[["X",transform.x.toFixed(2)],["Y",transform.y.toFixed(2)],["S",transform.scale.toFixed(2)],["Rx",(transform.rotX*180/Math.PI).toFixed(0)+"°"],["Ry",(transform.rotY*180/Math.PI).toFixed(0)+"°"],["Rz",(transform.rotZ*180/Math.PI).toFixed(0)+"°"]].map(([k,v])=>(
-            <span key={k}><span style={{color:"#444"}}>{k}:</span>{v}</span>
+        {/* WebXR info chips */}
+        <div style={{ display:"flex", gap:8, marginTop:20, flexWrap:"wrap", justifyContent:"center" }}>
+          {["ARCore / ARKit", "6DoF Tracking", "Hit-Test Placement", "No OpenCV"].map(t => (
+            <div key={t} style={{
+              padding:"4px 10px", borderRadius:20, border:"1px solid #1e3a1e",
+              color:"#446644", fontSize:9, letterSpacing:1
+            }}>{t}</div>
           ))}
         </div>
       </div>
+    </div>
+  );
 
-      {/* RIGHT PANEL */}
-      <div style={{position:"absolute",top:56,right:16,zIndex:10,display:"flex",flexDirection:"column",alignItems:"flex-end",gap:8}}>
-        {/* Tracking indicator */}
-        {(step==="tracking")&&(
-          <div style={{display:"flex",alignItems:"center",gap:6,background:"rgba(0,0,0,0.65)",backdropFilter:"blur(8px)",borderRadius:8,padding:"6px 12px",border:"1px solid #222"}}>
-            <div style={{width:8,height:8,borderRadius:"50%",background:tColor,animation:trackingState==="active"?"dotPulse 1.5s infinite":"none"}} />
-            <span style={{fontSize:10,fontFamily:"monospace",color:tColor,letterSpacing:1}}>{tLabel}</span>
+  // ─────────────────────────────────────────────
+  // ── RENDER: AR SCREEN ──
+  // ─────────────────────────────────────────────
+  return (
+    <div style={{ position:"relative", width:"100vw", height:"100vh", overflow:"hidden", background:"#000" }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;700&display=swap');
+        @keyframes toastIn { from{opacity:0;transform:translate(-50%,-12px) scale(0.9)} to{opacity:1;transform:translate(-50%,0) scale(1)} }
+        @keyframes scanRing { 0%{transform:scale(0.4);opacity:0.8} 100%{transform:scale(2);opacity:0} }
+        @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
+        @keyframes fadeIn { from{opacity:0} to{opacity:1} }
+        @keyframes slideUp { from{opacity:0;transform:translateY(20px)} to{opacity:1;transform:translateY(0)} }
+        .btn-place { transition:all 0.15s; }
+        .btn-place:active { transform:scale(0.95); }
+        .btn-sm:active { transform:scale(0.95); }
+      `}</style>
+
+      {toast && <Toast {...toast} onDone={() => setToast(null)} />}
+
+      {/* WebXR canvas — Three.js renders here, camera feed is automatic */}
+      <canvas ref={canvasRef} style={{ position:"absolute", inset:0, width:"100%", height:"100%" }} />
+
+      {/* DOM Overlay — UI on top of AR */}
+      <div id="ar-overlay" style={{ position:"absolute", inset:0, pointerEvents:"none" }}>
+
+        {/* Gesture capture layer (pointer events only when placed) */}
+        <div ref={gestureLayerRef} style={{
+          position:"absolute", inset:0,
+          pointerEvents: isPlaced ? "auto" : "none",
+          touchAction:"none"
+        }} />
+
+        {/* ── TOP BAR ── */}
+        <div style={{
+          position:"absolute", top:0, left:0, right:0,
+          background:"rgba(0,0,0,0.55)", backdropFilter:"blur(12px)",
+          padding:"12px 16px", display:"flex", alignItems:"center",
+          justifyContent:"space-between", pointerEvents:"auto",
+          borderBottom:"1px solid rgba(0,255,136,0.1)"
+        }}>
+          <div style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:10, color:"#00ff88", letterSpacing:4 }}>
+            CAD · AR
           </div>
-        )}
-
-        {/* Start/Stop Tracking */}
-        {step==="camera"&&(
-          <button onClick={captureReference} disabled={!cvReady||cvError} style={{
-            padding:"12px 16px",borderRadius:8,minWidth:160,
-            background:cvReady?"rgba(0,255,136,0.12)":"rgba(255,255,255,0.04)",
-            border:`1px solid ${cvReady?"#00ff88":"#333"}`,
-            color:cvReady?"#00ff88":"#555",fontSize:11,fontFamily:"monospace",letterSpacing:1,
-            cursor:cvReady?"pointer":"not-allowed",
-            animation:cvReady?"pulse 2s infinite":"none"
-          }}>
-            {!cvReady&&!cvError?<><span style={{animation:"spin 1s linear infinite",display:"inline-block",marginRight:6}}>◌</span>LOADING CV...</>
-              :cvError?"CV UNAVAILABLE":"▶  START TRACKING"}
-          </button>
-        )}
-        {step==="tracking"&&(
-          <button onClick={stopTracking} style={{
-            padding:"12px 16px",borderRadius:8,minWidth:160,
-            background:"rgba(255,68,68,0.12)",border:"1px solid #ff4444",
-            color:"#ff4444",fontSize:11,fontFamily:"monospace",letterSpacing:1,cursor:"pointer"
-          }}>■  STOP TRACKING</button>
-        )}
-
-        {/* Back */}
-        <button onClick={()=>{cleanupAll();setStep("upload");setParseInfo(null);setTrackingState("idle");}} style={{
-          padding:"8px 14px",borderRadius:8,background:"rgba(255,255,255,0.04)",
-          border:"1px solid #2a2a2a",color:"#555",fontSize:10,fontFamily:"monospace",cursor:"pointer"
-        }}>← BACK</button>
-      </div>
-
-      {/* CONTROLS HINT */}
-      <div style={{position:"absolute",bottom:24,left:16,zIndex:10,background:"rgba(0,0,0,0.7)",backdropFilter:"blur(8px)",borderRadius:10,padding:"12px 14px",border:"1px solid #1e1e1e"}}>
-        <div style={{fontSize:9,color:"#00ff88",letterSpacing:3,marginBottom:8,fontFamily:"monospace"}}>CONTROLS</div>
-        {[["👆","Drag","Move XY"],["🤏","Pinch","Scale"],["✌️","2-finger","Rotate Y"],["🖱️","Scroll","Scale"],["⇧+R","Right-drag","Rotate X"],["⌃+R","Right-drag","Rotate Z"]].map(([ic,k,v])=>(
-          <div key={k} style={{display:"flex",gap:6,marginBottom:3,alignItems:"center"}}>
-            <span style={{fontSize:11,width:22}}>{ic}</span>
-            <span style={{fontSize:10,color:"#444",fontFamily:"monospace",width:48}}>{k}</span>
-            <span style={{fontSize:10,color:"#888",fontFamily:"monospace"}}>{v}</span>
+          <div style={{ display:"flex", gap:10, fontFamily:"'JetBrains Mono',monospace", fontSize:10, color:"#00ff8899" }}>
+            <span><span style={{ color:"#334" }}>S:</span>{transform.scale.toFixed(3)}</span>
+            <span><span style={{ color:"#334" }}>Ry:</span>{(transform.rotY * 180/Math.PI).toFixed(0)}°</span>
           </div>
-        ))}
-      </div>
-
-      {/* TRACKING LOST OVERLAY */}
-      {step==="tracking"&&trackingState==="lost"&&(
-        <div style={{position:"absolute",top:"50%",left:"50%",transform:"translate(-50%,-50%)",zIndex:10,background:"rgba(0,0,0,0.85)",border:"1px solid #ffcc00",borderRadius:10,padding:"20px 28px",textAlign:"center"}}>
-          <div style={{fontSize:24,marginBottom:8}}>⚠️</div>
-          <div style={{color:"#ffcc00",fontFamily:"monospace",fontSize:13,letterSpacing:2,fontWeight:700}}>TRACKING LOST</div>
-          <div style={{color:"#666",fontSize:11,marginTop:6,fontFamily:"monospace"}}>Move camera back to object</div>
+          <button className="btn-sm" onClick={() => { cleanupAR(); setStep("upload"); setIsPlaced(false); setScanning(true); }}
+            style={{
+              background:"rgba(255,255,255,0.05)", border:"1px solid #1a2a1a",
+              color:"#556655", padding:"6px 12px", borderRadius:6,
+              fontSize:10, fontFamily:"'JetBrains Mono',monospace",
+              cursor:"pointer", letterSpacing:1, pointerEvents:"auto"
+            }}>← EXIT</button>
         </div>
-      )}
+
+        {/* ── SCANNING STATE — center reticle guidance ── */}
+        {!isPlaced && (
+          <div style={{
+            position:"absolute", top:"50%", left:"50%",
+            transform:"translate(-50%,-50%)",
+            textAlign:"center", pointerEvents:"none",
+            animation:"fadeIn 0.5s ease"
+          }}>
+            {scanning && (
+              <>
+                <ScanRing />
+                <div style={{
+                  fontFamily:"'JetBrains Mono',monospace", fontSize:11,
+                  color:"#00ff88", letterSpacing:3,
+                  animation:"blink 1.5s ease-in-out infinite"
+                }}>SCANNING SURFACE</div>
+                <div style={{ color:"#445", fontSize:9, marginTop:6, letterSpacing:1 }}>
+                  Move camera slowly over a flat surface
+                </div>
+              </>
+            )}
+            {!scanning && hitAvailable && (
+              <div style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:11, color:"#00ff88", letterSpacing:2 }}>
+                ✦ SURFACE DETECTED
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── PLACE BUTTON ── */}
+        {!isPlaced && hitAvailable && (
+          <div style={{
+            position:"absolute", bottom:120, left:"50%", transform:"translateX(-50%)",
+            pointerEvents:"auto", animation:"slideUp 0.4s cubic-bezier(0.34,1.56,0.64,1)"
+          }}>
+            <button className="btn-place" onClick={placeModel} style={{
+              padding:"18px 48px", borderRadius:50,
+              background:"#00ff88", color:"#000",
+              border:"none", fontSize:14, fontWeight:700,
+              cursor:"pointer", letterSpacing:3,
+              fontFamily:"'JetBrains Mono',monospace",
+              boxShadow:"0 8px 32px rgba(0,255,136,0.4)"
+            }}>
+              ⊕ PLACE MODEL
+            </button>
+          </div>
+        )}
+
+        {/* ── PLACED: CONTROLS HINT + REPOSITION ── */}
+        {isPlaced && (
+          <>
+            {/* Controls bottom */}
+            <div style={{
+              position:"absolute", bottom:24, left:"50%", transform:"translateX(-50%)",
+              display:"flex", flexDirection:"column", alignItems:"center", gap:12,
+              pointerEvents:"auto", animation:"slideUp 0.4s ease"
+            }}>
+              {/* Gesture hints */}
+              <div style={{
+                background:"rgba(0,0,0,0.65)", backdropFilter:"blur(10px)",
+                borderRadius:12, padding:"10px 20px", border:"1px solid #1a2a1a",
+                display:"flex", gap:20
+              }}>
+                {[["👆", "Drag", "Rotate"], ["🤏", "Pinch", "Scale"]].map(([ic, k, v]) => (
+                  <div key={k} style={{ textAlign:"center" }}>
+                    <div style={{ fontSize:18, marginBottom:2 }}>{ic}</div>
+                    <div style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:9, color:"#00ff88", letterSpacing:1 }}>{v}</div>
+                    <div style={{ fontFamily:"'JetBrains Mono',monospace", fontSize:8, color:"#334", letterSpacing:1 }}>{k}</div>
+                  </div>
+                ))}
+              </div>
+
+              {/* Reposition button */}
+              <button className="btn-place" onClick={repositionModel} style={{
+                padding:"12px 32px", borderRadius:50,
+                background:"rgba(0,0,0,0.6)", border:"1px solid #00ff8844",
+                color:"#00ff88", fontSize:11, fontWeight:700, cursor:"pointer",
+                letterSpacing:2, fontFamily:"'JetBrains Mono',monospace"
+              }}>
+                ↺ REPOSITION
+              </button>
+            </div>
+
+            {/* Placed indicator top */}
+            <div style={{
+              position:"absolute", top:72, left:"50%", transform:"translateX(-50%)",
+              background:"rgba(0,255,136,0.1)", border:"1px solid #00ff8833",
+              borderRadius:20, padding:"4px 14px",
+              fontFamily:"'JetBrains Mono',monospace", fontSize:9,
+              color:"#00ff88", letterSpacing:2, pointerEvents:"none"
+            }}>
+              ● MODEL PLACED
+            </div>
+          </>
+        )}
+
+        {/* ── FOV Tuner (debug) ── */}
+        <div style={{
+          position:"absolute", top:72, right:16, pointerEvents:"auto"
+        }}>
+          <button onClick={() => setShowFovTuner(s => !s)} style={{
+            background:"rgba(0,0,0,0.55)", border:"1px solid #1a2a1a",
+            color:"#446644", padding:"6px 10px", borderRadius:6,
+            fontSize:9, fontFamily:"'JetBrains Mono',monospace", cursor:"pointer", letterSpacing:1
+          }}>FOV</button>
+          {showFovTuner && (
+            <div style={{
+              marginTop:8, background:"rgba(0,0,0,0.8)", border:"1px solid #1a2a1a",
+              borderRadius:10, padding:"12px 14px", minWidth:140
+            }}>
+              <div style={{ color:"#00ff88", fontSize:9, letterSpacing:2, marginBottom:8, fontFamily:"'JetBrains Mono',monospace" }}>
+                FOV: {fov}°
+              </div>
+              <input type="range" min={40} max={100} value={fov} step={1}
+                onChange={e => {
+                  const v = parseInt(e.target.value);
+                  setFov(v);
+                  if (cameraRef.current) {
+                    cameraRef.current.fov = v;
+                    cameraRef.current.updateProjectionMatrix();
+                  }
+                }}
+                style={{ width:"100%", accentColor:"#00ff88" }}
+              />
+              <div style={{ color:"#334", fontSize:8, marginTop:4, fontFamily:"'JetBrains Mono',monospace" }}>
+                40° ←→ 100°
+              </div>
+            </div>
+          )}
+        </div>
+
+      </div>{/* end ar-overlay */}
     </div>
   );
 }
